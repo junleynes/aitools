@@ -166,7 +166,7 @@ _pb_paused = False
 
 @app.route('/api/playback/start', methods=['POST'])
 def pb_start():
-    global _pb_cap
+    global _pb_cap, _pb_paused
     path, err = load_video(request)
     if not path:
         return jsonify(error=err), 400
@@ -174,6 +174,7 @@ def pb_start():
         if _pb_cap:
             _pb_cap.release()
         _pb_cap = cv2.VideoCapture(path)
+        _pb_paused = False  # a new video always starts playing, even if the last one was paused
         info = get_video_info(path)
     return jsonify(status='ok', **info)
 
@@ -280,14 +281,41 @@ def api_vision():
 def too_large(e):
     return jsonify(error='File too large (max 2GB).'), 413
 
+def _model_supports_vision(name):
+    # /api/tags does not include per-model capabilities, so we have to ask
+    # /api/show for each model individually to find out if it's a vision model.
+    try:
+        r = requests.post(f'{OLLAMA_URL}/api/show', json={'model': name}, timeout=10)
+        data = r.json()
+        caps = data.get('capabilities', [])
+        if caps:
+            return 'vision' in caps
+        # Older Ollama versions don't return `capabilities` at all - fall back
+        # to checking the projector/family info that vision models expose.
+        details = data.get('details', {}) or {}
+        families = (details.get('families') or []) + [details.get('family', '')]
+        if any('clip' in f.lower() or 'mllama' in f.lower() or 'vision' in f.lower() for f in families if f):
+            return True
+        return 'vision' in name.lower() or 'vl' in name.lower()
+    except Exception:
+        # If we can't introspect the model, guess from its name rather than
+        # silently dropping it from the list.
+        return 'vision' in name.lower() or 'vl' in name.lower()
+
 @app.route('/api/vision/models')
 def api_vision_models():
     try:
         r = requests.get(f'{OLLAMA_URL}/api/tags', timeout=10)
-        models = [m['name'] for m in r.json().get('models', []) if 'vision' in str(m.get('capabilities', []))]
-        return jsonify(models=models)
-    except:
+        names = [m['name'] for m in r.json().get('models', [])]
+    except Exception:
         return jsonify(models=[])
+    if not names:
+        return jsonify(models=[])
+    from concurrent.futures import ThreadPoolExecutor
+    with ThreadPoolExecutor(max_workers=min(8, len(names))) as ex:
+        flags = list(ex.map(_model_supports_vision, names))
+    models = [n for n, ok in zip(names, flags) if ok]
+    return jsonify(models=models)
 
 # ---- Trailer Generator (ffmpeg) ----
 
@@ -320,6 +348,9 @@ def api_trailer():
     fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
     video_duration = total_frames / fps if fps else 0
+    src_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 1280
+    src_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 720
+    src_fps = fps if fps and fps > 0 else 30
     cap.release()
 
     trailer_duration = max(5, min(video_duration * trailer_pct / 100, 120))
@@ -428,8 +459,11 @@ def api_trailer():
 
     out_path = os.path.join(app.config['UPLOAD_FOLDER'], f'trailer_{base_ts}.mp4')
 
+    norm = (f'scale={src_w}:{src_h}:force_original_aspect_ratio=decrease,'
+            f'pad={src_w}:{src_h}:(ow-iw)/2:(oh-ih)/2,setsar=1,fps={src_fps}')
+
     if n_total == 1:
-        r = subprocess.run([FFMPEG, '-y', '-i', all_inputs[0],
+        r = subprocess.run([FFMPEG, '-y', '-i', all_inputs[0], '-vf', norm,
                             '-c:v', 'libx264', '-preset', 'fast', '-crf', '22',
                             '-pix_fmt', 'yuv420p', out_path], capture_output=True, text=True)
         if r.returncode != 0:
@@ -447,16 +481,23 @@ def api_trailer():
                 durations.append(5)
 
         xfade_dur = 0.3
-        filter_parts = []
+        # Normalize every clip (segments AND any end/schedule cards) to the same
+        # resolution/aspect/fps first - xfade requires matching frame sizes,
+        # and user-uploaded card videos rarely match the source video.
+        filter_parts = [f'[{i}:v]{norm}[n{i}]' for i in range(n_total)]
+        prev_label = 'n0'
         for i in range(n_total - 1):
             offset = sum(durations[:i + 1]) - (i + 1) * xfade_dur
-            filter_parts.append(f'[{i}][{i+1}]xfade=transition=fade:duration={xfade_dur}:offset={offset}[v{i+1}]')
+            out_label = f'v{i+1}'
+            filter_parts.append(
+                f'[{prev_label}][n{i+1}]xfade=transition=fade:duration={xfade_dur}:offset={max(offset, 0)}[{out_label}]')
+            prev_label = out_label
 
         cmd = [FFMPEG, '-y']
         for f in all_inputs:
             cmd.extend(['-i', f])
         cmd.extend(['-filter_complex', ';'.join(filter_parts)])
-        last_label = f'[v{n_total-1}]'
+        last_label = f'[{prev_label}]'
         cmd.extend(['-map', last_label])
         cmd.extend(['-c:v', 'libx264', '-preset', 'fast', '-crf', '22', '-pix_fmt', 'yuv420p', '-an', out_path])
         r = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
@@ -489,57 +530,140 @@ UI = '''
 <html>
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>AI Video Toolkit - OpenCV, PySceneDetect, Ollama Vision & FFmpeg</title>
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230b1220'/%3E%3Cpath d='M9 10h9l3 3v9H9z' fill='none' stroke='%2334e6c5' stroke-width='2'/%3E%3Ccircle cx='13' cy='16' r='2.4' fill='%2334e6c5'/%3E%3C/svg%3E">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=IBM+Plex+Sans:wght@400;500;600&family=JetBrains+Mono:wght@400;500;600;700&display=swap" rel="stylesheet">
 <style>
 *{box-sizing:border-box;margin:0;padding:0}
-body{background:#f0f2f5;color:#333;padding:30px;font-family:Segoe UI,sans-serif}
-.container{max-width:1100px;margin:0 auto}
-h1 .small{font-size:14px;color:#666;font-weight:400}
-.tabs{display:flex;gap:2px;margin:20px 0;flex-wrap:wrap}
-.tab{padding:12px 20px;cursor:pointer;background:#ddd;border:none;font-size:15px;border-radius:6px 6px 0 0;white-space:nowrap;font-family:inherit;outline:none;user-select:none}
-.tab:hover{background:#ccc}
-.tab.active{background:#fff;font-weight:700}
-.tab-sub{font-size:11px;color:#666;display:block;font-weight:400}
-.panel{display:none;background:#fff;border-radius:0 6px 6px 6px;box-shadow:0 2px 8px rgba(0,0,0,.1);padding:20px;margin-bottom:20px}
-.panel.active{display:block}
-.btn{background:#007bff;color:#fff;border:none;padding:8px 16px;border-radius:4px;cursor:pointer;font-size:14px;display:inline-block;text-decoration:none}
-.btn:hover{background:#0056b3}.btn.danger{background:#dc3545}
-.btn.small{padding:5px 12px;font-size:13px}
-label{display:block;margin:10px 0 4px;font-weight:700}
-input[type=file]{display:block;margin:10px 0}
-input[type=url],input[type=number]{width:100%;padding:8px;border:1px solid #ccc;border-radius:4px;margin:8px 0;font-size:15px}
-.or{text-align:center;color:#999;margin:8px 0;font-size:13px}
-.card{background:#f8f9fa;border-radius:6px;padding:15px;margin:10px 0}
-table{width:100%;border-collapse:collapse;margin:12px 0;font-size:14px}
-th,td{border:1px solid #ddd;padding:6px 10px;text-align:left}
-th{background:#f0f0f0}
-.filters{display:flex;gap:6px;margin:12px 0;flex-wrap:wrap}
-.stream-wrap{text-align:center}
-.stream-wrap img{max-width:100%;border:1px solid #ddd;border-radius:4px;max-height:550px}
-.info{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin:10px 0}
-.info-item{background:#f0f0f0;padding:6px 10px;border-radius:4px;font-size:13px}
-.info-item strong{display:inline-block;min-width:60px}
-.no-data{text-align:center;padding:30px;color:#888;font-size:15px}
-.progress{width:100%;margin:8px 0;cursor:pointer}
+:root{
+  --bg:#0b1220;
+  --panel:#121a2b;
+  --elevated:#1a2436;
+  --sunken:#03070d;
+  --line:#263149;
+  --ink:#e7edf6;
+  --ink-dim:#8b98ad;
+  --phosphor:#34e6c5;
+  --phosphor-dim:#1d8f7c;
+  --tally:#ff5470;
+  --amber:#ffb545;
+  --radius:10px;
+}
+html{scroll-behavior:smooth}
+body{
+  background:
+    radial-gradient(ellipse 900px 480px at 12% -12%, rgba(52,230,197,.07), transparent 60%),
+    radial-gradient(ellipse 700px 400px at 100% 0%, rgba(255,181,69,.05), transparent 55%),
+    var(--bg);
+  color:var(--ink);
+  font-family:'IBM Plex Sans',system-ui,-apple-system,sans-serif;
+  padding-bottom:92px;
+  min-height:100vh;
+  -webkit-font-smoothing:antialiased;
+}
+.container{max-width:1080px;margin:0 auto;padding:28px 24px 20px}
+
+/* ---- header ---- */
+.hdr{position:sticky;top:0;z-index:20;background:rgba(11,18,32,.88);backdrop-filter:blur(10px);border-bottom:1px solid var(--line)}
+.hdr-inner{max-width:1080px;margin:0 auto;padding:16px 24px;display:flex;align-items:center;justify-content:space-between;gap:16px;flex-wrap:wrap}
+h1{font-family:'JetBrains Mono',monospace;font-size:16px;font-weight:700;letter-spacing:.04em;text-transform:uppercase;display:flex;align-items:center;gap:9px}
+h1::before{content:'▚';color:var(--phosphor);font-size:14px}
+h1 small{font-family:'JetBrains Mono',monospace;font-weight:400;text-transform:none;letter-spacing:0;font-size:11px;color:var(--ink-dim);display:block;margin-top:4px}
+.hdr-engines{font-family:'JetBrains Mono',monospace;font-size:10px;color:var(--ink-dim);letter-spacing:.09em;text-transform:uppercase;white-space:nowrap}
+
+/* ---- bottom page selector (DaVinci-style tool dock) ---- */
+.tabs{position:fixed;left:0;right:0;bottom:0;z-index:30;display:flex;justify-content:center;gap:2px;background:rgba(13,19,32,.96);backdrop-filter:blur(10px);border-top:1px solid var(--line);padding:7px 10px;overflow-x:auto}
+.tab{font-family:'JetBrains Mono',monospace;padding:8px 16px;cursor:pointer;background:transparent;border:1px solid transparent;color:var(--ink-dim);font-size:11px;letter-spacing:.03em;text-transform:uppercase;border-radius:8px;white-space:nowrap;user-select:none;text-align:center;transition:color .15s,background .15s,border-color .15s}
+.tab:hover{color:var(--ink);background:rgba(255,255,255,.04)}
+.tab.active{color:var(--phosphor);background:rgba(52,230,197,.09);border-color:rgba(52,230,197,.28)}
+.tab-icon{display:block;font-size:15px;margin-bottom:3px}
+.tab-sub{font-size:9px;color:var(--ink-dim);display:block;font-weight:400;letter-spacing:.06em;margin-top:3px;text-transform:none}
+.tab.active .tab-sub{color:var(--phosphor-dim)}
+
+.panel{display:none;background:var(--panel);border:1px solid var(--line);border-radius:var(--radius);padding:24px;margin-bottom:20px}
+.panel.active{display:block;animation:fade-in .2s ease}
+@keyframes fade-in{from{opacity:0;transform:translateY(4px)}to{opacity:1;transform:none}}
+
+h2{font-family:'JetBrains Mono',monospace;font-size:13px;text-transform:uppercase;letter-spacing:.05em;color:var(--ink);margin-bottom:16px;padding-bottom:11px;border-bottom:1px solid var(--line);display:flex;align-items:center;gap:9px}
+h2::before{content:'';width:6px;height:6px;background:var(--phosphor);border-radius:1px;flex:none}
+h2 small{font-family:'IBM Plex Sans',sans-serif;text-transform:none;letter-spacing:0;font-weight:400;color:var(--ink-dim);font-size:12px}
+
+p{color:var(--ink-dim);font-size:13px;line-height:1.65;margin:8px 0}
+
+.btn{font-family:'JetBrains Mono',monospace;background:transparent;color:var(--phosphor);border:1px solid var(--phosphor-dim);padding:9px 18px;border-radius:7px;cursor:pointer;font-size:12px;letter-spacing:.04em;text-transform:uppercase;display:inline-block;text-decoration:none;transition:all .15s}
+.btn:hover{background:rgba(52,230,197,.1);border-color:var(--phosphor)}
+.btn:active{transform:translateY(1px)}
+.btn:focus-visible,input:focus-visible,select:focus-visible{outline:2px solid var(--phosphor);outline-offset:2px}
+.btn.danger{color:var(--tally);border-color:rgba(255,84,112,.5)}
+.btn.danger:hover{background:rgba(255,84,112,.1);border-color:var(--tally)}
+.btn.small{padding:6px 13px;font-size:11px}
+.btn.active-filter{background:var(--phosphor);color:#04140f;border-color:var(--phosphor);font-weight:600}
+
+label{display:block;margin:16px 0 6px;font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:.06em;color:var(--ink-dim)}
+input[type=file]{display:block;margin:10px 0;color:var(--ink-dim);font-size:13px;font-family:'IBM Plex Sans',sans-serif}
+input[type=url],input[type=number],input[type=text],select{width:100%;padding:10px 12px;background:var(--elevated);border:1px solid var(--line);border-radius:7px;margin:6px 0;font-size:14px;color:var(--ink);font-family:'IBM Plex Sans',sans-serif}
+select{appearance:none;background-image:linear-gradient(45deg,transparent 50%,var(--ink-dim) 50%),linear-gradient(135deg,var(--ink-dim) 50%,transparent 50%);background-position:calc(100% - 18px) center,calc(100% - 13px) center;background-size:5px 5px,5px 5px;background-repeat:no-repeat}
+.or{text-align:center;color:var(--ink-dim);margin:12px 0;font-size:10px;font-family:'JetBrains Mono',monospace;text-transform:uppercase;letter-spacing:.1em;display:flex;align-items:center;gap:10px}
+.or::before,.or::after{content:'';flex:1;height:1px;background:var(--line)}
+
+.card{background:var(--elevated);border:1px solid var(--line);border-radius:8px;padding:16px;margin:12px 0}
+table{width:100%;border-collapse:collapse;margin:14px 0;font-size:13px}
+th,td{border-bottom:1px solid var(--line);padding:9px 10px;text-align:left;font-variant-numeric:tabular-nums}
+th{color:var(--ink-dim);font-family:'JetBrains Mono',monospace;font-size:10px;text-transform:uppercase;letter-spacing:.05em;font-weight:500}
+td{font-size:13px}
+tr:hover td{background:rgba(255,255,255,.02)}
+code{font-family:'JetBrains Mono',monospace;background:var(--elevated);padding:2px 6px;border-radius:4px;font-size:12px;color:var(--phosphor);border:1px solid var(--line)}
+pre{font-family:'JetBrains Mono',monospace;background:var(--sunken);border:1px solid var(--line);padding:14px;border-radius:8px;font-size:12px;overflow-x:auto;line-height:1.75;color:var(--ink-dim)}
+
+.filters{display:flex;gap:6px;margin:14px 0;flex-wrap:wrap;align-items:center}
+.rec-dot{display:inline-block;width:8px;height:8px;border-radius:50%;background:var(--tally);margin-right:4px;animation:pulse 1.4s infinite ease-in-out;vertical-align:middle}
+.rec-label{font-family:'JetBrains Mono',monospace;font-size:11px;color:var(--tally);letter-spacing:.04em;text-transform:uppercase;display:none;align-items:center}
+.rec-label.live{display:inline-flex}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.25}}
+
+.stream-wrap{text-align:center;position:relative;padding:16px;background:var(--sunken);border-radius:10px;border:1px solid var(--line)}
+.stream-wrap img,.stream-wrap video,.stream-wrap canvas{max-width:100%;border-radius:4px;max-height:550px;display:inline-block}
+.corner{position:absolute;width:16px;height:16px;border-color:var(--phosphor-dim);opacity:.65;pointer-events:none}
+.corner.tl{top:10px;left:10px;border-top:2px solid;border-left:2px solid;border-radius:3px 0 0 0}
+.corner.tr{top:10px;right:10px;border-top:2px solid;border-right:2px solid;border-radius:0 3px 0 0}
+.corner.bl{bottom:10px;left:10px;border-bottom:2px solid;border-left:2px solid;border-radius:0 0 0 3px}
+.corner.br{bottom:10px;right:10px;border-bottom:2px solid;border-right:2px solid;border-radius:0 0 3px 0}
+
+.info{display:grid;grid-template-columns:repeat(auto-fill,minmax(150px,1fr));gap:8px;margin:12px 0}
+.info-item{background:var(--elevated);border:1px solid var(--line);padding:8px 12px;border-radius:6px;font-size:12px;font-family:'JetBrains Mono',monospace;color:var(--ink-dim)}
+.info-item strong{color:var(--phosphor);font-weight:600;margin-right:5px}
+.no-data{text-align:center;padding:50px 20px;color:var(--ink-dim);font-size:12.5px;font-family:'JetBrains Mono',monospace;border:1px dashed var(--line);border-radius:8px;margin-top:14px;letter-spacing:.02em}
+
+input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:4px;background:var(--line);border-radius:2px;margin:16px 0 8px;cursor:pointer}
+input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:14px;height:14px;border-radius:50%;background:var(--phosphor);cursor:pointer;box-shadow:0 0 0 4px rgba(52,230,197,.15)}
+input[type=range]::-moz-range-thumb{width:14px;height:14px;border-radius:50%;background:var(--phosphor);border:none;cursor:pointer}
+
+@media (prefers-reduced-motion:reduce){.rec-dot{animation:none}.panel.active{animation:none}html{scroll-behavior:auto}}
+@media (max-width:640px){.hdr-engines{display:none}.panel{padding:18px}}
 </style>
 </head>
 <body>
+<div class="hdr"><div class="hdr-inner">
+  <h1>AI Video Toolkit<small>Computer vision &amp; video engineering console</small></h1>
+  <div class="hdr-engines">opencv &middot; pyscenedetect &middot; ollama &middot; ffmpeg</div>
+</div></div>
 <div class="container">
-<h1>AI Video Toolkit <small>OpenCV + PySceneDetect + Ollama Vision + FFmpeg</small></h1>
 <div class="tabs">
-  <div class="tab active" onclick="switchTab('p-upload',this)" role="button" tabindex="0">Upload<div class=tab-sub>OpenCV+PySceneDetect</div></div>
-  <div class="tab" onclick="switchTab('p-player',this)" role="button" tabindex="0">Player<div class=tab-sub>OpenCV</div></div>
-  <div class="tab" onclick="switchTab('p-webcam',this)" role="button" tabindex="0">Webcam<div class=tab-sub>Browser JS+Canvas</div></div>
-  <div class="tab" onclick="switchTab('p-vision',this)" role="button" tabindex="0">Vision AI<div class=tab-sub>Ollama</div></div>
-  <div class="tab" onclick="switchTab('p-trailer',this)" role="button" tabindex="0">Trailer<div class=tab-sub>All+FFmpeg</div></div>
-  <div class="tab" onclick="switchTab('p-api',this)" role="button" tabindex="0">API</div>
+  <div class="tab active" onclick="switchTab('p-upload',this)" role="button" tabindex="0"><span class=tab-icon>&#8682;</span>Upload<div class=tab-sub>opencv+scenedetect</div></div>
+  <div class="tab" onclick="switchTab('p-player',this)" role="button" tabindex="0"><span class=tab-icon>&#9654;</span>Player<div class=tab-sub>opencv</div></div>
+  <div class="tab" onclick="switchTab('p-webcam',this)" role="button" tabindex="0"><span class=tab-icon>&#9679;</span>Webcam<div class=tab-sub>browser js+canvas</div></div>
+  <div class="tab" onclick="switchTab('p-vision',this)" role="button" tabindex="0"><span class=tab-icon>&#9673;</span>Vision AI<div class=tab-sub>ollama</div></div>
+  <div class="tab" onclick="switchTab('p-trailer',this)" role="button" tabindex="0"><span class=tab-icon>&#9636;</span>Trailer<div class=tab-sub>all+ffmpeg</div></div>
+  <div class="tab" onclick="switchTab('p-api',this)" role="button" tabindex="0"><span class=tab-icon>{ }</span>API<div class=tab-sub>reference</div></div>
 </div>
 
 <script>function switchTab(id,btn){document.querySelectorAll('.tab').forEach(t=>t.classList.remove('active'));document.querySelectorAll('.panel').forEach(p=>p.classList.remove('active'));btn.classList.add('active');document.getElementById(id).classList.add('active')}</script>
 
 <!-- Upload -->
 <div id="p-upload" class="panel active">
-<h2>Upload & Analyze</h2>
+<h2>Upload &amp; Analyze</h2>
 <form method=POST action=/upload enctype=multipart/form-data onsubmit="return true">
   <input type=file name=file accept=video/*>
   <div class=or>or</div>
@@ -580,10 +704,13 @@ th{background:#f0f0f0}
 </form>
 <div id=pb-area style=display:none>
   <div class=info id=pb-info></div>
-  <div class=stream-wrap><img id=pb-feed></div>
+  <div class=stream-wrap>
+    <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
+    <img id=pb-feed>
+  </div>
   <input type=range class=progress id=pb-progress min=0 max=100 value=0>
   <div class=filters>
-    <button class="btn small" id="pb-raw">Raw</button>
+    <button class="btn small active-filter" id="pb-raw">Raw</button>
     <button class="btn small" id="pb-gray">Gray</button>
     <button class="btn small" id="pb-edges">Edges</button>
     <button class="btn small" id="pb-hsv">HSV</button>
@@ -602,7 +729,8 @@ th{background:#f0f0f0}
 <h2>Live Webcam <small>Runs in your browser</small></h2>
 <div class=filters>
   <button class="btn small" id="wc-start">Start Camera</button>
-  <button class="btn small" id="wc-raw">Raw</button>
+  <span class="rec-label" id="wc-rec"><span class=rec-dot></span>Live</span>
+  <button class="btn small active-filter" id="wc-raw">Raw</button>
   <button class="btn small" id="wc-gray">Gray</button>
   <button class="btn small" id="wc-edges">Edges</button>
   <button class="btn small" id="wc-hsv">HSV</button>
@@ -610,6 +738,7 @@ th{background:#f0f0f0}
   <button class="btn small danger" id="wc-stop">Stop</button>
 </div>
 <div class=stream-wrap>
+  <i class="corner tl"></i><i class="corner tr"></i><i class="corner bl"></i><i class="corner br"></i>
   <video id=wc-video autoplay playsinline style="display:none"></video>
   <canvas id=wc-canvas></canvas>
 </div>
@@ -651,13 +780,14 @@ th{background:#f0f0f0}
 document.getElementById('tf').addEventListener('submit', async function(e){
   e.preventDefault()
   document.getElementById('tr-area').style.display='none'
+  document.getElementById('tr-prompt').style.display='block'
   document.getElementById('tr-prompt').textContent='Generating trailer... (this may take a while)'
   let r=await fetch('/api/trailer/generate',{method:'POST',body:new FormData(this)})
   let d=await r.json()
   document.getElementById('tr-prompt').style.display='none'
   if(d.error){document.getElementById('tr-stats').innerHTML='<b>Error:</b> '+d.error; document.getElementById('tr-area').style.display='block'; return}
   document.getElementById('tr-stats').innerHTML='Trailer: '+d.trailer_duration+'s ('+d.trailer_pct+'% of '+d.video_duration+'s video) from '+d.selected_scenes+'/'+d.total_scenes+' scenes'
-  document.getElementById('tr-video').innerHTML='<video controls style=max-width:100%><source src="'+d.trailer_url+'" type="video/mp4"></video>'
+  document.getElementById('tr-video').innerHTML='<video controls style=max-width:100%;border-radius:8px><source src="'+d.trailer_url+'" type="video/mp4"></video>'
   let rows=''
   d.scenes.forEach(s=>{rows+='<tr><td>'+s.scene+'</td><td>'+s.start+'s</td><td>'+s.end+'s</td><td>'+s.quality+'</td><td>'+s.duration+'</td></tr>'})
   document.getElementById('tr-table').innerHTML='<tr><th>#</th><th>Start</th><th>End</th><th>Score</th><th>Used</th></tr>'+rows
@@ -706,6 +836,7 @@ loadModels()
 document.getElementById('vf').addEventListener('submit', async function(e){
   e.preventDefault()
   document.getElementById('vr-area').style.display='none'
+  document.getElementById('vr-prompt').style.display='block'
   document.getElementById('vr-prompt').textContent='Analyzing...'
   let r=await fetch('/api/vision/analyze',{method:'POST',body:new FormData(this)})
   let d=await r.json()
@@ -745,6 +876,11 @@ GET  /api/playback/stop</pre>
 <script>// webcam
 // Webcam (client-side via getUserMedia + Canvas)
 let wcStream=null, wcFilter='raw', wcAnimId=null
+function setWCActiveBtn(f){
+  ['raw','gray','edges','hsv','blur'].forEach(m=>{
+    document.getElementById('wc-'+m).classList.toggle('active-filter', m===f)
+  })
+}
 async function startCam(){
   try{
     if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
@@ -756,6 +892,7 @@ async function startCam(){
           let v=document.getElementById('wc-video')
           v.srcObject=stream
           v.play()
+          document.getElementById('wc-rec').classList.add('live')
           drawWC()
         }, function(e){ alert('Camera error: '+e.message) })
         return
@@ -772,10 +909,11 @@ async function startCam(){
     let v=document.getElementById('wc-video')
     v.srcObject=wcStream
     await v.play()
+    document.getElementById('wc-rec').classList.add('live')
     drawWC()
   }catch(e){alert('Camera error: '+e.message)}
 }
-function setWCFilter(f){ wcFilter=f }
+function setWCFilter(f){ wcFilter=f; setWCActiveBtn(f) }
 function drawWC(){
   let v=document.getElementById('wc-video')
   let c=document.getElementById('wc-canvas')
@@ -804,7 +942,6 @@ function drawWC(){
     ctx.filter='none'
     img=ctx.getImageData(0,0,c.width,c.height)
     d=img.data
-    wcFilter='raw'; // single frame blur, revert
   }
   ctx.putImageData(img,0,0)
   wcAnimId=requestAnimationFrame(drawWC)
@@ -813,6 +950,7 @@ function stopCam(){
   if(wcStream){wcStream.getTracks().forEach(t=>t.stop());wcStream=null}
   if(wcAnimId){cancelAnimationFrame(wcAnimId);wcAnimId=null}
   document.getElementById('wc-canvas').width=0;document.getElementById('wc-canvas').height=0
+  document.getElementById('wc-rec').classList.remove('live')
 }
 document.getElementById('wc-start').addEventListener('click',startCam)
 document.getElementById('wc-raw').addEventListener('click',()=>setWCFilter('raw'))
@@ -826,6 +964,9 @@ document.getElementById('wc-stop').addEventListener('click',stopCam)
 ['raw','gray','edges','hsv','blur','face','motion'].forEach(m=>{
   document.getElementById('pb-'+m).addEventListener('click',()=>{
     document.getElementById('pb-feed').src='/api/playback/stream/'+m
+    ;['raw','gray','edges','hsv','blur','face','motion'].forEach(x=>{
+      document.getElementById('pb-'+x).classList.toggle('active-filter', x===m)
+    })
   })
 })
 document.getElementById('pb-playbtn').addEventListener('click',async function(){
@@ -858,6 +999,9 @@ document.getElementById('pf').addEventListener('submit', async function(e){
   document.getElementById('pb-feed').src='/api/playback/stream/raw'
   document.getElementById('pb-progress').max=Math.floor(d.duration_sec)
   document.getElementById('pb-playbtn').textContent='Pause'
+  ;['raw','gray','edges','hsv','blur','face','motion'].forEach(x=>{
+    document.getElementById('pb-'+x).classList.toggle('active-filter', x==='raw')
+  })
 })
 </script>
 </body>
